@@ -42,10 +42,10 @@ team_t team = {
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
 
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
-/* get 4 bytes data from starting address p */
-#define GET(p) (*(unsigned int*)(p))
-/* put 4 bytes data to starting address p */
-#define PUT(p,val) (*(unsigned int*)(p) = (val))
+/* get 8 bytes data from starting address p */
+#define GET(p) (*(long*)(p))
+/* put 8 bytes data to starting address p */
+#define PUT(p,val) (*(long*)(p) = (val))
 /* pack size and alloc into 4 bytes data*/
 #define PACK(size,alloc) ((size) | (alloc))
 /* get the size from a payload pointer */
@@ -53,13 +53,13 @@ team_t team = {
 /* get the alloced or not value from a payload pointer */
 #define GET_ALLOC(ptr) (GET(HDRP(ptr)) & (0x1))
 /* get the header pointer from a payload pointer */
-#define HDRP(bp) ((bp) - ALIGNMENT)
+#define HDRP(bp) ((bp) - SIZE_T_SIZE)
 /* get the footer pointer from a payload pointer */
-#define FTRP(bp) ((bp) + GET_SIZE(bp) - 2 * ALIGNMENT)
+#define FTRP(bp) ((bp) + GET_SIZE(bp) - 2 * SIZE_T_SIZE)
 /* get the payload pointer of next block */
 #define NEXT_BLK(bp) ((bp) + GET_SIZE(bp))
 /* get the payload pointer of previous block */
-#define PREV_BLK(bp) ((bp) - (GET(bp - 2 * ALIGNMENT) & (~0x7)))
+#define PREV_BLK(bp) ((bp) - (GET(bp - 2 * SIZE_T_SIZE) & (~0x7)))
 /* the minimium size to call sbrk with */
 #define CHUNK_SIZE (ALIGN((1 << 12)))
 /* payload pointer of the prelogue block */
@@ -68,7 +68,32 @@ team_t team = {
 #define HEAP_START (mem_heap_lo())
 /* get end address of the heap */
 #define HEAP_END (mem_heap_hi() + 1)
-
+/* get the payload pointer of previous free block */
+#define PREV_FREE_BLK(bp) ((void *)(*(long *)(bp)))
+/* get the payload pointer of next free block */
+#define NEXT_FREE_BLK(bp) ((void *)(*(long *)(bp + SIZE_T_SIZE)))
+/* set the payload pointer of previous free block to ptr */
+#define SET_PREV_FREE_BLK(bp,ptr) (*(long *)(bp) = (long)(ptr))
+/* set the payload pointer of next free block to ptr */
+#define SET_NEXT_FREE_BLK(bp,ptr) (*(long *)(bp + SIZE_T_SIZE) = (long)(ptr))
+/* for free block */
+/*    +--------+----------------+-----------------+--------------+--------+    */   
+/*    | header | prev free addr | next free addr  | free payload | footer |    */
+/*    +--------+----------------+-----------------+--------------+--------+    */
+/*    | 8      | 8              | 8               | n            | 8      |    */
+/*    +--------+----------------+-----------------+--------------+--------+    */
+/* head of the explicit free block linked list */
+static void *linked_list_head = NULL;
+static void print_heap(char  *);
+static void insert_to_linked_list_head(void *);
+static void extend_block(void *ptr,size_t request_size, size_t total_size);
+static void remove_from_linked_list(void *);
+static void* linked_list_first_fit(size_t);
+static void place(void *, size_t, size_t);
+static void *first_fit(size_t);
+static void *best_fit(size_t);
+void coalesce(void *);
+static void mm_memcpy(void *, void *, size_t);
 /*
  *  print_heap - A debug helper function that traverse the heap and print information of all heaps
  *  msg is the addtional information to figure out where this function is called
@@ -79,9 +104,75 @@ static void print_heap(char *msg) {
 		printf("%s\n", msg);
 	printf("Heap status -------------------------------\n");
 	for (void *ptr = PRELOGUE_BLK; GET_SIZE(ptr) != 0; ptr = NEXT_BLK(ptr)) {
-		printf("payload start = %x payload end = %x size = %d alloc = %d header = %x footer = %x\n",
-				ptr, FTRP(ptr), GET_SIZE(ptr), GET_ALLOC(ptr), HDRP(ptr),FTRP(ptr));
+		printf("payload start = %lx payload end = %lx size = %ld alloc = %ld header = %lx footer = %lx\n",
+				(long)ptr, (long)FTRP(ptr), GET_SIZE(ptr), GET_ALLOC(ptr), (long)HDRP(ptr), (long)FTRP(ptr));
 	}
+}
+
+/* 
+ * print_linked_list - A debug helper function that traverse the free block linked list and print information
+ */
+static void print_linked_list(char *msg) {
+	if (msg[0] != '\0')
+		printf("%s\n", msg);
+	printf("Linked list status -------------------------------\n");
+	for (void* ptr = linked_list_head; ptr != NULL; ptr = NEXT_FREE_BLK(ptr)) {
+		printf("prev: %lx current: %lx next: %lx\n", (long)PREV_FREE_BLK(ptr), (long)ptr, (long)NEXT_FREE_BLK(ptr));
+	}
+}
+
+/*
+ * insert_to_linked_list_head - insert a free block pointer ptr to the head of the free block linked list
+ */
+static void insert_to_linked_list_head(void *ptr) {
+	if (linked_list_head == NULL) {
+		SET_PREV_FREE_BLK(ptr,0);
+		SET_NEXT_FREE_BLK(ptr,0);
+	} else {
+		SET_PREV_FREE_BLK(linked_list_head, ptr);
+		SET_NEXT_FREE_BLK(ptr, linked_list_head);
+		SET_PREV_FREE_BLK(ptr, 0);
+	}
+	linked_list_head = ptr;
+}
+
+/*
+ * remove_from_linked_list - remove a free block's pointer information from the free block linked list
+ */
+static void remove_from_linked_list(void *ptr) {
+	if (PREV_FREE_BLK(ptr) == NULL && NEXT_FREE_BLK(ptr) == NULL) {
+		linked_list_head = NULL;
+	} else if (PREV_FREE_BLK(ptr) != NULL && NEXT_FREE_BLK(ptr) == NULL) {
+		SET_NEXT_FREE_BLK(PREV_FREE_BLK(ptr), NULL);
+	} else if (PREV_FREE_BLK(ptr) == NULL && NEXT_FREE_BLK(ptr) != NULL) {
+		SET_PREV_FREE_BLK(NEXT_FREE_BLK(ptr), NULL);
+		linked_list_head = NEXT_FREE_BLK(ptr);
+	} else {	
+		SET_NEXT_FREE_BLK(PREV_FREE_BLK(ptr), NEXT_FREE_BLK(ptr));
+		SET_PREV_FREE_BLK(NEXT_FREE_BLK(ptr), PREV_FREE_BLK(ptr));
+	}
+}
+
+/*
+ * linked_list_best_fit - using the free block linked list to find the best free block for size_t size
+ */
+static void* linked_list_best_fit(size_t size) {
+	if (linked_list_head == NULL) {
+		return NULL;
+	}
+	if (NEXT_FREE_BLK(linked_list_head) == NULL && PREV_FREE_BLK(linked_list_head) == NULL) {
+		if (GET_SIZE(linked_list_head) >= size) return linked_list_head;
+		else return NULL;
+	}
+	size_t min_size = (1 << 30);
+	void *min_pos = NULL;
+	for (void *cursor = linked_list_head; cursor != NULL; cursor = NEXT_FREE_BLK(cursor)) {
+		if (GET_SIZE(cursor) >= size && GET_SIZE(cursor) < min_size) {
+			min_size = GET_SIZE(cursor);
+			min_pos = cursor;
+		}
+	}
+	return min_pos;
 }
 
 /* 
@@ -99,11 +190,33 @@ int mm_init(void)
 	/* put the free block between prelogue and epilogue */
 	PUT(start_addr + SIZE_T_SIZE * 2, PACK(CHUNK_SIZE - 3 * SIZE_T_SIZE,0));
 	PUT(HEAP_END - SIZE_T_SIZE * 2, PACK(CHUNK_SIZE - 3 * SIZE_T_SIZE,0));
+	/* set linked list head to NULL cauz mm_init can be called more than once */
+	linked_list_head = NULL;
+	/* add linked list information to the block */
+	insert_to_linked_list_head(start_addr + SIZE_T_SIZE * 3);
 	return 0;
 }
 
 /*
- * place - Occupy a block with blk_size to satisfy with a request of size
+ * linked_list_first_fit - using the free block linked list to find the first fit free block
+ * the latest freed block is inserted to the head of the list
+ */
+static void* linked_list_first_fit(size_t size) {
+	if (linked_list_head == NULL) {
+		return NULL;
+	}
+	if (NEXT_FREE_BLK(linked_list_head) == NULL && PREV_FREE_BLK(linked_list_head) == NULL) {
+		if (GET_SIZE(linked_list_head) >= size) return linked_list_head;
+		else return NULL;
+	}
+	for (void *cursor = linked_list_head; cursor != NULL; cursor = NEXT_FREE_BLK(cursor)) {
+		if (GET_SIZE(cursor) >= size) return cursor;
+	}
+	return NULL;
+}
+
+/*
+ * place - Occupy a free block with blk_size to satisfy with a request of size
  * size - the request size
  * blk_size - the total size that ptr contains
  *
@@ -111,9 +224,12 @@ int mm_init(void)
  * cases in mm_realloc
  */
 static void place(void *ptr, size_t size, size_t blk_size) {
-	if (blk_size >= size + 3 * ALIGNMENT) {
+	/* place assume ptr points to a free block */
+	remove_from_linked_list(ptr);
+	if (blk_size >= size + SIZE_T_SIZE * 5) {
 		PUT(HDRP(ptr),PACK(size,1));
 		PUT(FTRP(ptr),PACK(size,1));
+		insert_to_linked_list_head(NEXT_BLK(ptr));
 		PUT(HDRP(NEXT_BLK(ptr)),PACK(blk_size - size,0));
 		PUT(FTRP(NEXT_BLK(ptr)),PACK(blk_size - size,0));
 	} else {
@@ -123,8 +239,29 @@ static void place(void *ptr, size_t size, size_t blk_size) {
 }
 
 /*
- * first_fit -Find the first block that satisfy with the request of size, return NULL if not found
+ * extend_block - this function is similar to place, but ptr points to a block that is allocated or uninitialized
+ * this function is useful in realloc
  */
+
+static void extend_block(void *ptr,size_t request_size, size_t total_size) {
+	/* extend block assumes the block is not a free block (allocated or uninitialized one) */
+	if (total_size >= request_size + SIZE_T_SIZE * 5) {
+		PUT(HDRP(ptr),PACK(request_size,1));
+		PUT(FTRP(ptr),PACK(request_size,1));
+		insert_to_linked_list_head(NEXT_BLK(ptr));	
+		PUT(HDRP(NEXT_BLK(ptr)),PACK(total_size - request_size,0));
+		PUT(FTRP(NEXT_BLK(ptr)),PACK(total_size - request_size,0));
+	} else {
+		PUT(HDRP(ptr),PACK(total_size,1));
+		PUT(FTRP(ptr),PACK(total_size,1));
+	}
+}
+
+/*
+ * first_fit -Find the first block that satisfy with the request of size, return NULL if not found
+ * this is used in implicit free list
+ */
+
 static void *first_fit(size_t size) {
 	for (void* ptr = PRELOGUE_BLK; GET_SIZE(ptr) != 0; ptr = NEXT_BLK(ptr)) {
 		if (!GET_ALLOC(ptr) && GET_SIZE(ptr) >= size) {
@@ -135,7 +272,8 @@ static void *first_fit(size_t size) {
 }
 
 /*
- * best_fit -Find the block with least free payload size that satisfy with the request of size
+ * best_fit -Find the block with least free payload size that satisfy with the request of size, return NULL if not found
+ * this is used in implicit free list
  */
 static void *best_fit(size_t size) {
 	size_t min_size = 1 << 30;
@@ -157,7 +295,7 @@ void *mm_malloc(size_t size)
 {
 	/* add size with header and footer size, and align it */
 	size_t new_size = ALIGN(size + 2 * SIZE_T_SIZE);
-	void *pos = best_fit(new_size);
+	void *pos = linked_list_best_fit(new_size);
 	/* a suitable free block found */
 	if (pos != NULL) {
 		place(pos,new_size,GET_SIZE(pos));
@@ -168,7 +306,10 @@ void *mm_malloc(size_t size)
 	void *new_addr = mem_sbrk(size_to_alloc);
 	if (new_addr == (void *) -1) return NULL;
 	else {
-		place(new_addr, new_size, size_to_alloc);
+		/* new_addr doesn't point to a initialized free block */
+		/* so we shouldn't use place */
+		/* place assume new_addr in the free block linked list */
+		extend_block(new_addr, new_size, size_to_alloc);
 		/* move the epilogue to the end of the heap */
 		PUT(new_addr + size_to_alloc - SIZE_T_SIZE,PACK(0,1));
 		return new_addr;
@@ -190,18 +331,28 @@ void coalesce(void *ptr) {
 		/* we must save total size in advance */
 		/* GET_SIZE(ptr) + GET_SIZE(prev_ptr) will get changed as the prev block header changed */ 
 		total_size = GET_SIZE(ptr) + GET_SIZE(prev_ptr);
+		remove_from_linked_list(ptr);
+		remove_from_linked_list(prev_ptr);
 		PUT(HDRP(prev_ptr),PACK(total_size,0));
 		PUT(FTRP(ptr),PACK(total_size,0));
+		insert_to_linked_list_head(prev_ptr);
 	/* the previous block is allocated and the next block is free */
 	} else if (GET_ALLOC(prev_ptr) && !GET_ALLOC(next_ptr)) {
 		total_size = GET_SIZE(ptr) + GET_SIZE(next_ptr);
+		remove_from_linked_list(next_ptr);
+		remove_from_linked_list(ptr);
 		PUT(HDRP(ptr),PACK(total_size,0));
 		PUT(FTRP(next_ptr),PACK(total_size,0));
+		insert_to_linked_list_head(ptr);
 	/* both the previous block and the next one is free */
 	} else {
 		total_size = GET_SIZE(next_ptr) + GET_SIZE(prev_ptr) + GET_SIZE(ptr);	
+		remove_from_linked_list(ptr);
+		remove_from_linked_list(prev_ptr);
+		remove_from_linked_list(next_ptr);
 		PUT(HDRP(prev_ptr),PACK(total_size,0));
 		PUT(FTRP(next_ptr),PACK(total_size,0));
+		insert_to_linked_list_head(prev_ptr);
 	}
 }
 
@@ -209,10 +360,11 @@ void coalesce(void *ptr) {
  * mm_free - Freeing a block does nothing.
  */
 void mm_free(void *ptr)
-{	
+{
 	/* changed the alloc bit to 0 and try coalescing with neighbours */
 	PUT(HDRP(ptr),PACK(GET_SIZE(ptr),0));
 	PUT(FTRP(ptr),PACK(GET_SIZE(ptr),0));
+	insert_to_linked_list_head(ptr);
 	coalesce(ptr);
 }
 
@@ -250,25 +402,31 @@ void *mm_realloc(void *ptr, size_t size)
 	/* the next block is free and coalesced size is large enough for request size */
 	if (!GET_ALLOC(NEXT_BLK(ptr)) && (GET_SIZE(ptr) + GET_SIZE(NEXT_BLK(ptr))) >= new_size ) {
 		/* just coalesce two blocks */
-		place(ptr, new_size, GET_SIZE(ptr) + GET_SIZE(NEXT_BLK(ptr)));
+		remove_from_linked_list(NEXT_BLK(ptr));
+		extend_block(ptr, new_size, GET_SIZE(ptr) + GET_SIZE(NEXT_BLK(ptr)));
 		return ptr;
 	/* the previous block is free ... */
 	} else if (!GET_ALLOC(PREV_BLK(ptr)) && (GET_SIZE(ptr) + GET_SIZE(PREV_BLK(ptr))) >= new_size) {
 		/* call to PREV_BLK will get wrong result after mm_memcpy, so make a copy of it first */
 		void* prev_ptr = PREV_BLK(ptr);
 		size_t total_size = GET_SIZE(ptr) + GET_SIZE(prev_ptr);
+		/* remove must be done before mm_memcpy */
+		/* mm_memcpy will cover the data in the free block */
+		remove_from_linked_list(PREV_BLK(ptr));
 		/* start of the block now lies in previous block, so we have to copy data */
 		mm_memcpy(prev_ptr, ptr, GET_SIZE(ptr) - 2 * SIZE_T_SIZE);		
 		/* coalesce blocks */
-		place(prev_ptr, new_size, total_size);
+		extend_block(prev_ptr, new_size, total_size);
 		return prev_ptr;
 	/* similar */
 	} else if (!GET_ALLOC(PREV_BLK(ptr)) && !GET_ALLOC(NEXT_BLK(ptr)) && (GET_SIZE(ptr) + GET_SIZE(PREV_BLK(ptr)) + GET_SIZE(NEXT_BLK(ptr)) >= new_size)) {
 		void* prev_ptr = PREV_BLK(ptr);
 		void* next_ptr = NEXT_BLK(ptr);
 		size_t total_size = GET_SIZE(ptr) + GET_SIZE(prev_ptr) + GET_SIZE(next_ptr);
+		remove_from_linked_list(PREV_BLK(ptr));
+		remove_from_linked_list(NEXT_BLK(ptr));
 		mm_memcpy(prev_ptr, ptr, GET_SIZE(ptr) - 2 * SIZE_T_SIZE);
-		place(prev_ptr, new_size, total_size);
+		extend_block(prev_ptr, new_size, total_size);
 		return prev_ptr;
 	}
 	/*no coalescing is possible, asking for more memory */
