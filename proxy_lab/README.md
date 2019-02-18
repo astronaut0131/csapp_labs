@@ -126,3 +126,33 @@ cache_t *find_cache_by_key(cache_queue_t *q, const char* key) {
 ```
 这里的读写者问题使用的是书上介绍的代码，挺好理解的，其他会改变队列内容的操作都要加上写锁。
 
+```
+/* put_cache function assumes cache is in q and cache's size <= MAX_OBJECT_SIZE */
+void put_cache(cache_queue_t *q, cache_t *cache) {
+	P(&q->writer_mutex);
+	if (q->head == NULL && q->tail == NULL) {
+		cache->next = cache->prev = NULL;
+		q->head = q->tail = cache;
+	} else {
+		/* swap out the victim cache if there is no space */
+		while (q->total_size + cache->size > MAX_CACHE_SIZE) {
+			eliminate_lru_cache(q);
+		}
+		if (q->head == NULL && q->tail == NULL) {
+			q->head = q->tail = cache;
+			cache->prev = cache->next = NULL;
+		}
+		else {
+			q->tail->next = cache;
+			cache->prev = q->tail;
+			cache->next = NULL;
+			q->tail = cache;
+		}
+	}
+	q->total_size += cache->size;
+	V(&q->writer_mutex);
+}
+```
+把cache块放到队尾，注意如果要放置的这块cache + 队列中已有cache的总大小 > MAX_CACHE_SIZE时，需要不断调用`eliminate_lru_cache`直到空间足够再把这块cache放入，同时也注意`free`掉被淘汰的cache的内存空间。
+		
+		
